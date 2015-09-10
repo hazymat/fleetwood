@@ -1,0 +1,4 @@
+#define degree_width 8
+#define degree_height 7
+static unsigned char degree_bits[] = {
+   0x3c, 0x66, 0xc3, 0xc3, 0xc3, 0x66, 0x3c };

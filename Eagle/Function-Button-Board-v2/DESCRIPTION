@@ -1,0 +1,8 @@
+Button board version 1 with some revisions (removed drill holes, added indent holes for switch, a small routing error).
+Header pins soldered to bottom of board (requires changing).
+Working, but could be improved with the following:
+- header pins: solder onto top side
+- bigger pads where possible
+- increase physical stability by adding more pin headers on each side (e.g. ground them)
+- refine x position of buttons
+- consider two header pin lines above and below buttons

@@ -1,11 +1,14 @@
 # fleetwood
 Home Automation Room Controller
 
+*** NOTE: Support for this project is not possible, however collaborators are warmly encouraged to contact me! ***
+
 Project consists of:
 - Arduino Sketch intended for Arduino Mega 2560
 - Eagle files for 4 PC boards
 
-Sketch and Eagle schematics and board layouts are shared for information only. Please note this project does not yet include an official BOM.
+1/ Sketch and Eagle schematics and board layouts are shared for information only.
+2/ This project does not yet include an official BOM.
 
    Copyright 2015 Mat Smith
 

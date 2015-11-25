@@ -1,4 +1,4 @@
-
+// 22/11/2015
 /******************************************/
 /*           Unit Settings                */
 /******************************************/
@@ -40,7 +40,8 @@ byte server[] = {192, 168, 0, 21};
 #define audiovector "audio"
 #define titlevector "title"
 #define artistvector "artist"
-#define tempvector "temp" // 
+#define tempvector "temp"
+#define boilervector "boiler"
 #define currentvector "current" // 
 #define volumevector "volume" // 
 #define playstatusvector "playstatus" // 
@@ -135,7 +136,7 @@ byte server[] = {192, 168, 0, 21};
 #define commandDataSelect	7	// OLED
 #define resetCtl                66      // don't ask. (separate w5100 reset)
 #define ardReset                69      // hardwired to reset pin of Arduino - physical reset by MQTT
-#define DHTPIN                  11      // DHT11 sensor (DHT22 is better, I had stock of the 11...)
+#define DHTPIN                  32      // was pin 11. With latest version of PCB, this is an external connector
 
 
 //BREADBOARD:
@@ -184,20 +185,25 @@ byte server[] = {192, 168, 0, 21};
 
 // Timeouts
 #define w5100resetdelay 800            // Definitely safe: 1500. Probably ok 500?
-#define startuphold 1500               // How long should we delay startup so allow us to view
-                                       //   the final page of status messages?
+#define startuphold 0                  // How long should we delay startup so allow us to view
+                                       //   the final page of status messages? (set to 0 for now as added big delays to settings request routine)
+                                       //   ... i.e. no point in delaying even more at startup
 #define button_leds_off_timeout 5000
 #define default_mode_timeout 7500
 #define display_dim_timeout 7000
 #define display_off_timeout 14000
 #define heartbeat_timeout 61000 // we expect an MQTT message at least every 60 seconds
 #define initialmqttconnecttimeout 5000 // should be 35000
+#define preset_stored_msg_timeout 1500
 
-#define mqttsettingsreqdelay 30  // Delay between requesting each setting over MQTT to allow OH to process
-#define mqttvalreqdelay 30       // Delay between requesting each value over MQTT to allow OH to process
 
-#define DHTTYPE DHT11   // DHT 11
-#define dhtpolldelay 20000    // Take reading and send every e.g. 2 seconds
+// Delay between requesting each setting / value over MQTT to allow OH to process
+// On this front, Arduino is really reliable with fast processing of MQTT, OpenHAB is not so!
+#define mqttsettingsreqdelay 400
+#define mqttvalreqdelay 400
+
+#define DHTTYPE DHT22   // DHT 22
+#define dhtpolldelay 20000    // Take reading and send every e.g. 20 seconds
 #define lightSensorDelay 1000 // #lux
 
 /******************************************/
@@ -234,10 +240,12 @@ char zonevect[15] = {'<','d','e','f','a','u','l','t','>','\0'};        // Zone v
 char zonepmsg[30] = {' ','\0'};        // Zone pager message (29 chars max to be received from OpenHAB)
 int capThreshAdjust = capInitialThreshold;     // Zone controller proximity sense adjustment
 int lowestCapVal = 9999;  // initialise with high number
-
+boolean boiler_status;
 
 // settings
-int circuitCount = 2;
+int circuitCount = 6; // This is the initial circuit count number. This is overwritten when Arduino receives setting from OpenHAB
+                      //  set to 6 so that we catch all circuit values in the case where values arrive before the setting itself
+                      //  If we see circuit value of -1, this means we think there is a circuit but haven't got the value yet
 char commandtopic[41]; // array size: topicroot/zonevector/commandvector (max 11 + 15 + 11 respectively, plus 2x "/" strings)
 
 // OPTIMISE THIS
@@ -254,17 +262,19 @@ char* settingsNames[] = {"Download", "Slow downld", "Diags", "Reboot", "Exit"}; 
 /*         Define global vars             */
 /******************************************/
 
-int oldPosition = 0;
+int oldPosition = 0;                 // This is for the rotary encoder
 int currentMode = lightMode;         // default mode
 int currentCircuit = 1;              // default circuit
 unsigned long defaultmodetimer;      // used for sleep delay, capsense delay, set mode to default
+unsigned long preset_stored_msg_timer;   // How long to display the message "preset stored"
 unsigned long heartbeatsense = 0;        // We expect an MQTT message every 1 minute (60000 millis) at least
                                          // There's an OH rule sending datetime at least every minute.
                                          // We use this as our heartbeat
 unsigned long dhtpollcounter;
 unsigned long lightSensorCounter; //#lux
 boolean gotinfofromserver = false;
-int mqttresponsetime = 0;
+int mqttresponsetime = 0;            // Boot sequence: show OpenHAB response time, i.e. difference in time between
+                                     //  sending an MQTT request message and receiving back a value
 
 uint16_t lasttouched = 0;  // #prox
 uint16_t currtouched = 0;  // #prox
@@ -310,7 +320,6 @@ void(* resetFunc) (void) = 0; //declare reset function @ address 0
 void setup()
 {
   digitalWrite(ardReset, HIGH); // don't move this line :)
-  
   
   pinMode(ardReset, OUTPUT);   // Set that pin as output, if we didn't already know
   // Setup U8G
@@ -461,7 +470,7 @@ void setup()
 
   startupState(6);
 
-  delay(startuphold);
+  delay(startuphold);            // Keep the startup display on the screen... so we can see last message
   turnLEDs(1);
   pinMode(2,INPUT);
   pinMode(3,INPUT);
@@ -473,6 +482,7 @@ void setup()
 
 }
 
+// Store pretty icons to progmem
 static unsigned char light_bits[] U8G_PROGMEM = {
    0x00, 0x3e, 0x00, 0x80, 0xff, 0x00, 0xc0, 0xc1, 0x01, 0x60, 0x00, 0x03,
    0x60, 0x20, 0x03, 0x30, 0x40, 0x06, 0x30, 0x40, 0x06, 0x30, 0x00, 0x06,
@@ -574,8 +584,11 @@ void drawControl(void) {
   if (millis() - heartbeatsense > heartbeat_timeout) {
     u8g.drawStr(245, 10, ":("); // Draw sad face if no signal received
   }
-
-  if (currentMode == diagsMode) {
+  if (millis() - preset_stored_msg_timer < preset_stored_msg_timeout) {
+      u8g.setFont(u8g_font_helvB12);
+      u8g.drawStr(major_text_x_coord - 20, major_text_y_coord, "Preset stored");
+  }
+  else if (currentMode == diagsMode) {
     // Draw some stuff!
 
   }
@@ -587,7 +600,7 @@ void drawControl(void) {
     u8g.setFont(u8g_font_5x8);
     int modeStringWidth = u8g.getStrWidth(modeText[currentMode-1]);
     u8g.drawStr(17-(modeStringWidth/2), 9, modeText[currentMode-1]);
-    u8g.drawStr(220, 9, "ALL ORF");
+    u8g.drawStr(220, 9, "ALL OFF");
 
     u8g.drawXBMP(alloff_x_coord, alloff_y_coord, alloff_width, alloff_height, alloff_bits);
 
@@ -611,9 +624,10 @@ void drawControl(void) {
     }
     else if (currentMode == tempMode) {
       u8g.setFont(u8g_font_helvB18);
-      sprintf (buff, "%3i", temp);
+      //sprintf (buff, "%3i", temp);
+      dtostrf(dht.readTemperature(), 4, 1, buff);
       u8g.drawStr( 22, 32, buff);
-      u8g.drawXBMP( 50, 13, degree_width, degree_height, degree_bits);
+      u8g.drawXBMP( 80, 13, degree_width, degree_height, degree_bits);
     }
     else if (currentMode == mvhrMode) {
       // no idea what to put here yet
@@ -631,8 +645,6 @@ void drawControl(void) {
       // Write name of current circuit
       u8g.setFont(u8g_font_6x10);
       u8g.drawStr(minor_text_x_coord - 20, minor_text_y_coord, lightCircuit[currentCircuit-1].name);
-
-
 
       #define circuitSpacing 24
 
@@ -655,6 +667,16 @@ void drawControl(void) {
     else if (currentMode == audioMode) {
       u8g.setFont(u8g_font_helvB12);
       u8g.drawStr(major_text_x_coord, major_text_y_coord, track);
+      u8g.setFont(u8g_font_helvB08);
+      u8g.drawStr(minor_text_x_coord, minor_text_y_coord, artist);
+    }
+    
+    else if (currentMode == tempMode) {
+      u8g.setFont(u8g_font_helvB12);
+      if (boiler_status) sprintf (buff, "%s%s", "Boiler: ", "ON");
+        else sprintf (buff, "%s%s", "Boiler: ", "OFF");
+      u8g.drawStr(major_text_x_coord, major_text_y_coord, buff);
+
       u8g.setFont(u8g_font_helvB08);
       u8g.drawStr(minor_text_x_coord, minor_text_y_coord, artist);
     }
@@ -821,11 +843,16 @@ void loop()
   if (btnTransport.clicks == 2) buttonFunc ("rotaryDouble");   // Double press rotary
   if (btnTransport.clicks == 3) buttonFunc ("rotaryTriple");   // Triple press rotary
   if (btnF1.clicks == 1) buttonFunc ("Button1");               // Press Favourite button 1
+  if (btnF1.clicks == -1) buttonFunc ("Store1");               // Store Favourite 1
   if (btnF1.clicks == 2) buttonFunc ("enterSettings");            // Double press Fave 2 button to download from server again
   if (btnF2.clicks == 1) buttonFunc ("Button2");               // Press Favourite button 2
+  if (btnF2.clicks == -1) buttonFunc ("Store2");               // Press Favourite button 2
   if (btnF3.clicks == 1) buttonFunc ("Button3");               // Press Favourite button 3
+  if (btnF3.clicks == -1) buttonFunc ("Store3");               // Press Favourite button 3
   if (btnF4.clicks == 1) buttonFunc ("Button4");               // Press Favourite button 4
+  if (btnF4.clicks == -1) buttonFunc ("Store4");               // Press Favourite button 4
   if (btnF5.clicks == 1) buttonFunc ("Button5");               // Press Favourite button 5
+  if (btnF5.clicks == -1) buttonFunc ("Store5");               // Press Favourite button 5
   if (btnOrf.clicks == 1) buttonFunc ("Orf");                  // Press Favourite button 5
 
   /******************************************/
@@ -845,7 +872,7 @@ void loop()
   client.loop();
   } // END U8G
   while( u8g.nextPage() ); // END U8G
-}
+} // end of loop
 
 
 /******************************************/
@@ -872,6 +899,26 @@ void buttonFunc(char* buttonName) // Function to handle button presses, includin
     if (buttonName == "Button3") client.publish(commandtopic, "Light3");
     if (buttonName == "Button4") client.publish(commandtopic, "Light4");
     if (buttonName == "Button5") client.publish(commandtopic, "Light5");
+    if (buttonName == "Store1") {
+    	client.publish(commandtopic, "StoreScene1");
+    	preset_stored_msg_timer = millis();
+    }
+    if (buttonName == "Store2") {
+    	client.publish(commandtopic, "StoreScene2");
+    	preset_stored_msg_timer = millis();
+    }
+    if (buttonName == "Store3") {
+    	client.publish(commandtopic, "StoreScene3");
+    	preset_stored_msg_timer = millis();
+    }
+    if (buttonName == "Store4") {
+    	client.publish(commandtopic, "StoreScene4");
+    	preset_stored_msg_timer = millis();
+    }
+    if (buttonName == "Store5") {
+    	client.publish(commandtopic, "StoreScene5");
+    	preset_stored_msg_timer = millis();
+    }
     if (buttonName == "rotarySingle") {if (currentCircuit < circuitCount) currentCircuit++; else currentCircuit = 1;}
     if (buttonName == "rotaryDouble"); // Do something here, e.g. toggle light state
   }
@@ -909,8 +956,6 @@ void buttonFunc(char* buttonName) // Function to handle button presses, includin
   if (currentMode == settingsMode) {
     if (buttonName == "Button1") gotinfofromserver = false; // Re-fetch server data
     if (buttonName == "Button2") {     // Re-fetch server data ... slooowly (delay between requests, gives time for OH to respond
-      #define mqttsettingsreqdelay 90  // Delay between requesting each setting over MQTT to allow OH to process
-      #define mqttvalreqdelay 90       // Delay between requesting each value over MQTT to allow OH to process
       gotinfofromserver = false;
     }
     if (buttonName == "Button3") currentMode = diagsMode;   // Go into diagnostic mode. (When in this mode, it stays forever until button press, this is set up in loop)
@@ -925,52 +970,93 @@ void buttonFunc(char* buttonName) // Function to handle button presses, includin
 void requestSettingsFromServer()
 {
   client.publish(commandtopic, "circuit_count_please");                  // Request how many light circuits there are
+  turnLEDs(1);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "circuit_names_please");                  // Request light circuit names
+  turnLEDs(0);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "light_scene_1_name_please");             // Request light scene 1 name
+  turnLEDs(1);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "light_scene_2_name_please");             // Request light scene 2 name
+  turnLEDs(0);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "light_scene_3_name_please");             // Request light scene 3 name
+  turnLEDs(1);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "light_scene_4_name_please");             // Request light scene 4 name
+  turnLEDs(0);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "light_scene_5_name_please");             // Request light scene 5 name
+  turnLEDs(1);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "audio_fave_1_name_please");              // Request audio fave 1 name
+  turnLEDs(0);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "audio_fave_2_name_please");              // Request audio fave 2 name
+  turnLEDs(1);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "audio_fave_3_name_please");              // Request audio fave 3 name
+  turnLEDs(0);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "audio_fave_4_name_please");              // Request audio fave 4 name
+  turnLEDs(1);
   delay(mqttsettingsreqdelay);
   client.publish(commandtopic, "audio_fave_5_name_please");              // Request audio fave 5 name
+  turnLEDs(0);
   delay(mqttsettingsreqdelay);
+  client.publish(commandtopic, "heat_profile_1_name_please");             // Request heating profile 1 name
+  turnLEDs(1);
+  delay(mqttsettingsreqdelay);
+  client.publish(commandtopic, "heat_profile_2_name_please");             // Request heating profile 2 name
+  turnLEDs(0);
+  delay(mqttsettingsreqdelay);
+  client.publish(commandtopic, "heat_profile_3_name_please");             // Request heating profile 3 name
+  turnLEDs(1);
+  delay(mqttsettingsreqdelay);
+  client.publish(commandtopic, "heat_profile_4_name_please");             // Request heating profile 4 name
+  turnLEDs(0);
+  delay(mqttsettingsreqdelay);
+  client.publish(commandtopic, "heat_profile_5_name_please");             // Request heating profile 5 name
+  turnLEDs(1);
+  delay(mqttsettingsreqdelay);
+
+  defaultmodetimer = millis(); // reset last action time - this brings device out of sleep
+
 }
 
 void requestValuesFromServer()
 {      client.publish(commandtopic, "datetime_please");           // Request date (one-off... OH to send new value at top of each minute)
+  turnLEDs(0);
       delay(mqttvalreqdelay);
       client.publish(commandtopic, "light_scene_please");        // Request current light scene
+  turnLEDs(1);
       delay(mqttvalreqdelay);
       client.publish(commandtopic, "light_levels_please");       // Request light circuit levels
+  turnLEDs(0);
       delay(mqttvalreqdelay);
       client.publish(commandtopic, "volume_please");             // Request volume
+  turnLEDs(1);
       delay(mqttvalreqdelay);
       client.publish(commandtopic, "play_status_please");        // Request play status
+  turnLEDs(0);
       delay(mqttvalreqdelay);
       client.publish(commandtopic, "track_please");              // Request track
+  turnLEDs(1);
       delay(mqttvalreqdelay);
       client.publish(commandtopic, "artist_please");             // Request album
+  turnLEDs(0);
       delay(mqttvalreqdelay);
-      client.publish(commandtopic, "temp_please");               // Request current room temp
+      client.publish(commandtopic, "node_settemp_please");       // Request current room temp
+  turnLEDs(1);
       delay(mqttvalreqdelay);
       client.publish(commandtopic, "temp_target_please");        // Request room temp setting
+  turnLEDs(0);
       delay(mqttvalreqdelay);
       client.publish(commandtopic, "mvhr_speed_please");         // Request MVHR speed seeting
+  turnLEDs(1);
       delay(mqttvalreqdelay);
+  defaultmodetimer = millis(); // reset last action time - this brings device out of sleep
 }
 
 void rotaryFunc(char direction[5]) // array with 5 elements to cope with the word "down" and a null terminator
@@ -1036,12 +1122,14 @@ void callback(char* topic, byte* payload, unsigned int length) {
       for (int i=0; i<2; i++) capValRead[i] = payload[i+9]; 
       capThreshAdjust = atoi( (const char*) capValRead);                   // zone controller proximity adjustment
     }
-    if (payload[4]==82) {
-      //resetFunc();
-      digitalWrite(ardReset, LOW);
+    if (payload[4]==82) {                                  // Remote reboot
+      resetFunc();
+      //digitalWrite(ardReset, LOW);
     }
-    if (payload[4]==85) {
+    if (payload[4]==85) {                                  // Update controller (i.e. send MQTT requests to download settings / data)
       gotinfofromserver = false;
+      defaultmodetimer = millis(); // reset last action time - this brings device out of sleep
+
     }
   }
   
@@ -1075,6 +1163,14 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
   sprintf (buff, "%s/%s/%s/%s", rootvector, zonevect, tempvector, currentvector); // home/bedroom/temp/current
   if(strcmp(topic, buff) == 0) temp = atoi( (const char*) payload );
+  
+  sprintf (buff, "%s/%s", rootvector, boilervector); // home/bedroom/temp/current
+  if(strcmp(topic, buff) == 0) {
+    if (payload[2]==78) {
+      boiler_status=true;
+    }
+  }
+  
   sprintf (buff, "%s/%s/%s/%s", rootvector, zonevect, audiovector, volumevector); // home/bedroom/audio/volume
   if(strcmp(topic, buff) == 0) volume = atoi( (const char*) payload );
   sprintf (buff, "%s/%s/%s/%s", rootvector, zonevect, audiovector, playstatusvector); // home/bedroom/audio/playstatus
